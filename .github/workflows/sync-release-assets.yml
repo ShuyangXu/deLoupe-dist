@@ -1,0 +1,122 @@
+name: Sync Release Assets
+
+on:
+  repository_dispatch:
+    types: [release-published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional release tag to sync. Leave empty to sync the latest release.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-release-assets
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_TOKEN: ${{ github.token }}
+      UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+      UPSTREAM_RELEASES_API: ${{ secrets.UPSTREAM_RELEASES_API }}
+      # repository_dispatch sets client_payload.tag; workflow_dispatch sets inputs.tag
+      REQUESTED_TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+    steps:
+      - name: Validate configuration
+        run: |
+          set -euo pipefail
+          if [[ -z "${UPSTREAM_TOKEN:-}" ]]; then
+            echo "Missing required secret: UPSTREAM_TOKEN" >&2
+            exit 1
+          fi
+          if [[ -z "${UPSTREAM_RELEASES_API:-}" ]]; then
+            echo "Missing required secret: UPSTREAM_RELEASES_API" >&2
+            exit 1
+          fi
+
+      - name: Resolve upstream release
+        id: upstream
+        run: |
+          set -euo pipefail
+
+          api_base="${UPSTREAM_RELEASES_API%/}"
+          release_json="$RUNNER_TEMP/upstream-release.json"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+
+          if [[ -n "${REQUESTED_TAG:-}" ]]; then
+            GH_TOKEN="$UPSTREAM_TOKEN" gh api "${api_base}/tags/${REQUESTED_TAG}" > "$release_json"
+          else
+            GH_TOKEN="$UPSTREAM_TOKEN" gh api "${api_base}/latest" > "$release_json"
+          fi
+
+          tag_name="$(jq -r '.tag_name' "$release_json")"
+          asset_count="$(jq -r '.assets | length' "$release_json")"
+
+          if [[ -z "$tag_name" || "$tag_name" == "null" ]]; then
+            echo "Unable to resolve upstream release tag" >&2
+            exit 1
+          fi
+
+          if [[ "$asset_count" -eq 0 ]]; then
+            echo "Upstream release has no assets to sync" >&2
+            exit 1
+          fi
+
+          cat > "$notes_file" <<EOF
+          Mirrored release assets for ${tag_name}.
+
+          This release is maintained automatically by GitHub Actions.
+          EOF
+
+          echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "release_json=$release_json" >> "$GITHUB_OUTPUT"
+          echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
+
+      - name: Download upstream assets
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/assets"
+          jq -r '.assets[] | [.name, .url] | @tsv' "${{ steps.upstream.outputs.release_json }}" |
+          while IFS=$'\t' read -r asset_name asset_api_url; do
+            GH_TOKEN="$UPSTREAM_TOKEN" gh api \
+              --header 'Accept: application/octet-stream' \
+              "$asset_api_url" > "$RUNNER_TEMP/assets/$asset_name"
+          done
+
+      - name: Create or update local release
+        run: |
+          set -euo pipefail
+
+          tag_name="${{ steps.upstream.outputs.tag_name }}"
+          notes_file="${{ steps.upstream.outputs.notes_file }}"
+
+          if GH_TOKEN="$TARGET_TOKEN" gh release view "$tag_name" >/dev/null 2>&1; then
+            GH_TOKEN="$TARGET_TOKEN" gh release edit "$tag_name" \
+              --title "$tag_name" \
+              --notes-file "$notes_file"
+          else
+            GH_TOKEN="$TARGET_TOKEN" gh release create "$tag_name" \
+              --title "$tag_name" \
+              --notes-file "$notes_file"
+          fi
+
+      - name: Upload mirrored assets
+        run: |
+          set -euo pipefail
+
+          tag_name="${{ steps.upstream.outputs.tag_name }}"
+          shopt -s nullglob
+          assets=("$RUNNER_TEMP"/assets/*)
+
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "No downloaded assets found" >&2
+            exit 1
+          fi
+
+          GH_TOKEN="$TARGET_TOKEN" gh release upload "$tag_name" "${assets[@]}" --clobber
