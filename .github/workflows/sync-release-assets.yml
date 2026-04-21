@@ -96,12 +96,16 @@ jobs:
           tag_name="${{ steps.upstream.outputs.tag_name }}"
           notes_file="${{ steps.upstream.outputs.notes_file }}"
 
-          if GH_TOKEN="$TARGET_TOKEN" gh release view "$tag_name" >/dev/null 2>&1; then
+          target_repo="${{ github.repository }}"
+
+          if GH_TOKEN="$TARGET_TOKEN" gh release view "$tag_name" --repo "$target_repo" >/dev/null 2>&1; then
             GH_TOKEN="$TARGET_TOKEN" gh release edit "$tag_name" \
+              --repo "$target_repo" \
               --title "$tag_name" \
               --notes-file "$notes_file"
           else
             GH_TOKEN="$TARGET_TOKEN" gh release create "$tag_name" \
+              --repo "$target_repo" \
               --title "$tag_name" \
               --notes-file "$notes_file"
           fi
@@ -119,4 +123,6 @@ jobs:
             exit 1
           fi
 
-          GH_TOKEN="$TARGET_TOKEN" gh release upload "$tag_name" "${assets[@]}" --clobber
+          GH_TOKEN="$TARGET_TOKEN" gh release upload "$tag_name" "${assets[@]}" \
+            --repo "${{ github.repository }}" \
+            --clobber
